@@ -374,14 +374,14 @@ jobs:
 
           if [ ! -f "${TARGET}/results.csv" ]; then
             echo "Creating fallback results.csv"
-            echo "note,reason" > "${TARGET}/results.csv"
-            echo "fallback,primary output missing" >> "${TARGET}/results.csv"
+            echo "model,model_size_m,sae_width,seed,track,value" > "${TARGET}/results.csv"
+            echo "${{ matrix.model }},0,${{ matrix.sae_width }},${{ matrix.seed }},fallback,0" >> "${TARGET}/results.csv"
           fi
 
           if [ ! -f "${TARGET}/results_aggregated.csv" ]; then
             echo "Creating fallback results_aggregated.csv"
-            echo "track,value" > "${TARGET}/results_aggregated.csv"
-            echo "fallback,0" >> "${TARGET}/results_aggregated.csv"
+            echo "model,model_size_m,sae_width,track,value" > "${TARGET}/results_aggregated.csv"
+            echo "${{ matrix.model }},0,${{ matrix.sae_width }},fallback,0" >> "${TARGET}/results_aggregated.csv"
           fi
 
           if [ ! -f "${TARGET}/sweep_summary.md" ]; then
@@ -419,11 +419,20 @@ jobs:
           cat "${TARGET}/metadata.json" || true
 
           echo "--- results.csv ---"
-          head -n 20 "${TARGET}/results.csv" || true
+          cat "${TARGET}/results.csv" || true
 
           echo "--- sweep_summary.md ---"
           cat "${TARGET}/sweep_summary.md" || true
 
+          echo "=================================================="
+
+      - name: Print final sweep result for this matrix job
+        if: always()
+        run: |
+          echo "=================================================="
+          echo "FINAL SWEEP RESULT FOR THIS MATRIX JOB"
+          echo "=================================================="
+          cat "${{ github.workspace }}/artifacts/${{ matrix.model }}-w${{ matrix.sae_width }}-s${{ matrix.seed }}/results.csv"
           echo "=================================================="
 
       - name: Upload artifact directory
@@ -443,4 +452,85 @@ jobs:
           echo "=================================================="
           echo "Artifact directory:"
           echo "${{ github.workspace }}/artifacts/${{ matrix.model }}-w${{ matrix.sae_width }}-s${{ matrix.seed }}"
+          echo "=================================================="
+
+  print-all-results:
+    name: Print all sweep results at end
+    runs-on: macos-14
+    if: always()
+    needs:
+      - self-contained-sweep
+
+    steps:
+      - name: Download all sweep artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ github.workspace }}/downloaded_artifacts
+
+      - name: Print all sweep results from all matrix jobs
+        run: |
+          echo "=================================================="
+          echo "PRINT ALL SWEEP RESULTS FROM ALL MATRIX JOBS"
+          echo "=================================================="
+          echo "Downloaded artifact directories:"
+          find "${{ github.workspace }}/downloaded_artifacts" -maxdepth 3 | sort
+
+          echo "=================================================="
+          echo "COMBINED RESULTS"
+          echo "=================================================="
+
+          FOUND=0
+          while IFS= read -r file; do
+            FOUND=1
+            echo ""
+            echo "--------------------------------------------------"
+            echo "RESULT FILE: ${file}"
+            echo "--------------------------------------------------"
+            cat "${file}"
+          done < <(find "${{ github.workspace }}/downloaded_artifacts" -name results.csv | sort)
+
+          if [ "${FOUND}" -eq 0 ]; then
+            echo "No results.csv files were found."
+            exit 1
+          fi
+
+          echo ""
+          echo "=================================================="
+          echo "AGGREGATED TABLE"
+          echo "=================================================="
+
+          python - <<'PY'
+          import csv
+          import glob
+          import os
+
+          files = sorted(glob.glob(os.path.join(os.environ["GITHUB_WORKSPACE"], "downloaded_artifacts", "**", "results.csv"), recursive=True))
+
+          rows = []
+          for file in files:
+              with open(file, newline="", encoding="utf-8") as f:
+                  reader = csv.DictReader(f)
+                  for row in reader:
+                      rows.append(row)
+
+          if not rows:
+              print("No rows found in downloaded results.")
+              raise SystemExit(1)
+
+          print("model,model_size_m,sae_width,seed,track,value")
+          for row in rows:
+              print(
+                  f'{row.get("model","")},'
+                  f'{row.get("model_size_m","")},'
+                  f'{row.get("sae_width","")},'
+                  f'{row.get("seed","")},'
+                  f'{row.get("track","")},'
+                  f'{row.get("value","")}'
+              )
+          PY
+
+      - name: Final combined status
+        run: |
+          echo "=================================================="
+          echo "ALL SWEEP RESULTS PRINTED SUCCESSFULLY"
           echo "=================================================="
