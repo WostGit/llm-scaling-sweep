@@ -1,4 +1,4 @@
-name: Self-Contained LLM Scaling Sweep (M1, No API Keys, No Missing Artifacts)
+name: Self-Contained LLM Scaling Sweep (M1, No API Keys, Reliable Artifacts)
 
 on:
   push:
@@ -23,7 +23,7 @@ on:
       max_parallel:
         description: "Maximum parallel matrix jobs"
         required: false
-        default: "3"
+        default: "2"
         type: string
 
 permissions:
@@ -40,11 +40,11 @@ jobs:
   small-scale-sweep:
     name: Sweep - ${{ matrix.model }} / width=${{ matrix.sae_width }} / seed=${{ matrix.seed }}
     runs-on: macos-14
-    timeout-minutes: 60
+    timeout-minutes: 45
 
     strategy:
       fail-fast: false
-      max-parallel: ${{ fromJSON(github.event.inputs.max_parallel || '3') }}
+      max-parallel: ${{ fromJSON(github.event.inputs.max_parallel || '2') }}
       matrix:
         model: [tiny-160m, mid-1.4b]
         sae_width: [16384, 65536]
@@ -54,7 +54,6 @@ jobs:
       PYTHON_VERSION: "3.12"
       SWEEP_MODE: ${{ github.event.inputs.sweep_mode || 'small-only' }}
       SWEEP_TRACKS: "polysemanticity,circuit_faithfulness,robustness_gap"
-      OUTDIR: results/${{ matrix.model }}-w${{ matrix.sae_width }}-s${{ matrix.seed }}
 
     steps:
       - name: Checkout
@@ -71,28 +70,29 @@ jobs:
           python -m pip install --upgrade pip setuptools wheel
           pip install numpy pandas matplotlib plotly
 
-      - name: Prepare output directory early
+      - name: Define output path
         run: |
-          mkdir -p "${OUTDIR}"
-          echo "artifact placeholder" > "${OUTDIR}/artifact_placeholder.txt"
-          echo "Prepared ${OUTDIR}"
-          ls -la "${OUTDIR}"
+          ARTIFACT_DIR="${GITHUB_WORKSPACE}/artifacts/${{ matrix.model }}-w${{ matrix.sae_width }}-s${{ matrix.seed }}"
+          mkdir -p "${ARTIFACT_DIR}"
+          echo "ARTIFACT_DIR=${ARTIFACT_DIR}" >> "$GITHUB_ENV"
 
-      - name: Verify runner and Python environment
+          # Create a guaranteed starter file immediately
+          echo "placeholder" > "${ARTIFACT_DIR}/artifact_placeholder.txt"
+
+          echo "Using artifact dir: ${ARTIFACT_DIR}"
+          ls -la "${ARTIFACT_DIR}"
+
+      - name: Verify runner
         run: |
-          echo "::group::Runner diagnostics"
           uname -a
           python - <<'PY'
-          import platform, sys, os
+          import os, platform, sys
           print("Python:", sys.version)
           print("Platform:", platform.platform())
           print("Machine:", platform.machine())
-          print("Runner OS:", os.environ.get("RUNNER_OS"))
-          print("Sweep mode:", os.environ.get("SWEEP_MODE"))
-          print("Tracks:", os.environ.get("SWEEP_TRACKS"))
-          print("OUTDIR:", os.environ.get("OUTDIR"))
+          print("GITHUB_WORKSPACE:", os.environ.get("GITHUB_WORKSPACE"))
+          print("ARTIFACT_DIR:", os.environ.get("ARTIFACT_DIR"))
           PY
-          echo "::endgroup::"
 
       - name: Write self-contained sweep script
         run: |
@@ -115,7 +115,6 @@ jobs:
               model_size_map = {
                   "tiny-160m": 160,
                   "mid-1.4b": 1400,
-                  "large-6.9b-proxy": 6900,
               }
               size_m = model_size_map.get(model, 160)
               log_scale = math.log10(size_m)
@@ -149,36 +148,50 @@ jobs:
                   })
               return rows
 
-          def write_summary(df, outdir, mode):
-              summary_path = outdir / "sweep_summary.md"
-              lines = [
-                  "# Sweep Summary",
-                  "",
-                  f"- Mode: `{mode}`",
-                  f"- Rows: `{len(df)}`",
-                  "",
-              ]
-              if len(df) > 0:
-                  for track in sorted(df["track"].unique()):
-                      sub = df[df["track"] == track]
-                      lines.append(f"## {track}")
-                      lines.append(f"- Mean value: `{sub['value'].mean():.4f}`")
-                      lines.append("")
-              else:
-                  lines.append("No rows generated.")
-              summary_path.write_text("\n".join(lines), encoding="utf-8")
+          def main():
+              parser = argparse.ArgumentParser()
+              parser.add_argument("--model", required=True)
+              parser.add_argument("--sae-width", type=int, required=True)
+              parser.add_argument("--seed", type=int, required=True)
+              parser.add_argument("--tracks", required=True)
+              parser.add_argument("--mode", required=True)
+              parser.add_argument("--output-dir", required=True)
+              args = parser.parse_args()
 
-          def make_plots(df, outdir):
-              if len(df) == 0:
-                  return
+              outdir = Path(args.output_dir)
+              outdir.mkdir(parents=True, exist_ok=True)
+
+              tracks = [x.strip() for x in args.tracks.split(",") if x.strip()]
+              rows = synthetic_metrics(args.model, args.sae_width, args.seed, tracks, args.mode)
+              df = pd.DataFrame(rows)
+
+              df.to_csv(outdir / "results.csv", index=False)
+
+              summary = (
+                  df.groupby(["model", "model_size_m", "sae_width", "track"], as_index=False)["value"]
+                  .mean()
+                  .sort_values(["model_size_m", "sae_width", "track"])
+              )
+              summary.to_csv(outdir / "results_aggregated.csv", index=False)
+
+              md = ["# Sweep Summary", ""]
+              md.append(f"- Model: `{args.model}`")
+              md.append(f"- SAE width: `{args.sae_width}`")
+              md.append(f"- Seed: `{args.seed}`")
+              md.append(f"- Mode: `{args.mode}`")
+              md.append("")
+              for track in sorted(df["track"].unique()):
+                  v = float(df.loc[df["track"] == track, "value"].mean())
+                  md.append(f"## {track}")
+                  md.append(f"- Mean value: `{v:.4f}`")
+                  md.append("")
+              (outdir / "sweep_summary.md").write_text("\n".join(md), encoding="utf-8")
 
               for track in sorted(df["track"].unique()):
-                  sub = df[df["track"] == track].copy()
+                  sub = df[df["track"] == track]
                   plt.figure(figsize=(8, 5))
-                  x = [str(x) for x in sub["sae_width"]]
-                  y = sub["value"].tolist()
-                  plt.plot(x, y, marker="o")
-                  plt.title(f"{track} by SAE width")
+                  plt.plot([str(args.sae_width)] * len(sub), sub["value"].tolist(), marker="o")
+                  plt.title(f"{track}")
                   plt.xlabel("SAE width")
                   plt.ylabel("value")
                   plt.tight_layout()
@@ -190,94 +203,56 @@ jobs:
                   x="model_size_m",
                   y="value",
                   color="track",
-                  symbol="track",
                   hover_data=["model", "sae_width", "seed"],
-                  title="Synthetic scaling sweep results",
-                  log_x=True,
+                  title="Synthetic sweep result"
               )
               fig.write_html(str(outdir / "results.html"))
 
-          def main():
-              parser = argparse.ArgumentParser()
-              parser.add_argument("--models", nargs="+", required=True)
-              parser.add_argument("--sae-widths", nargs="+", type=int, required=True)
-              parser.add_argument("--seeds", nargs="+", type=int, required=True)
-              parser.add_argument("--tracks", default="polysemanticity,circuit_faithfulness,robustness_gap")
-              parser.add_argument("--output-dir", required=True)
-              parser.add_argument("--mode", default="small-only")
-              args = parser.parse_args()
-
-              outdir = Path(args.output_dir)
-              outdir.mkdir(parents=True, exist_ok=True)
-
-              tracks = [x.strip() for x in args.tracks.split(",") if x.strip()]
-              rows = []
-
-              for model in args.models:
-                  for width in args.sae_widths:
-                      for seed in args.seeds:
-                          rows.extend(synthetic_metrics(model, width, seed, tracks, args.mode))
-
-              df = pd.DataFrame(rows)
-              df.to_csv(outdir / "results.csv", index=False)
-
-              agg = (
-                  df.groupby(["model", "model_size_m", "sae_width", "track"], as_index=False)["value"]
-                  .mean()
-                  .sort_values(["model_size_m", "sae_width", "track"])
-              )
-              agg.to_csv(outdir / "results_aggregated.csv", index=False)
-
-              write_summary(agg, outdir, args.mode)
-              make_plots(agg, outdir)
-
               payload = {
                   "rows": int(len(df)),
-                  "tracks": sorted(df["track"].unique().tolist()) if len(df) else [],
-                  "models": sorted(df["model"].unique().tolist()) if len(df) else [],
-                  "sae_widths": sorted(df["sae_width"].unique().tolist()) if len(df) else [],
+                  "model": args.model,
+                  "sae_width": args.sae_width,
+                  "seed": args.seed,
+                  "tracks": sorted(df["track"].unique().tolist()),
               }
               (outdir / "metadata.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
-
-              print("Completed synthetic sweep.")
               print(json.dumps(payload, indent=2))
 
           if __name__ == "__main__":
               main()
           PY
 
-      - name: Run self-contained sweep
+      - name: Run sweep
         run: |
           python sweep_inline.py \
-            --models "${{ matrix.model }}" \
-            --sae-widths "${{ matrix.sae_width }}" \
-            --seeds "${{ matrix.seed }}" \
+            --model "${{ matrix.model }}" \
+            --sae-width "${{ matrix.sae_width }}" \
+            --seed "${{ matrix.seed }}" \
             --tracks "${{ env.SWEEP_TRACKS }}" \
             --mode "${{ env.SWEEP_MODE }}" \
-            --output-dir "${OUTDIR}"
+            --output-dir "${ARTIFACT_DIR}"
 
-      - name: Verify output files exist
+      - name: Verify artifact files
         if: always()
         run: |
-          echo "Listing ${OUTDIR}"
-          ls -la "${OUTDIR}"
+          echo "Artifact directory: ${ARTIFACT_DIR}"
+          test -d "${ARTIFACT_DIR}"
 
-          test -d "${OUTDIR}" || (echo "Missing output directory" && exit 1)
-
-          # Guarantee at least one uploadable file exists
-          if [ ! -f "${OUTDIR}/results.csv" ]; then
-            echo "results.csv missing, creating fallback diagnostic files"
-            echo "fallback" > "${OUTDIR}/fallback.txt"
-            echo '{"status":"fallback-created"}' > "${OUTDIR}/metadata.json"
+          # Create guaranteed fallback files if sweep failed early
+          if [ ! -f "${ARTIFACT_DIR}/results.csv" ]; then
+            echo "Sweep output missing; writing fallback files"
+            echo "fallback artifact" > "${ARTIFACT_DIR}/fallback.txt"
+            echo '{"status":"fallback"}' > "${ARTIFACT_DIR}/metadata.json"
           fi
 
-          find "${OUTDIR}" -maxdepth 1 -type f | sort
+          echo "Contents:"
+          find "${ARTIFACT_DIR}" -maxdepth 1 -type f | sort
 
       - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: sweep-${{ matrix.model }}-w${{ matrix.sae_width }}-s${{ matrix.seed }}-${{ github.run_id }}
-          path: ${{ env.OUTDIR }}
+          path: ${{ github.workspace }}/artifacts/${{ matrix.model }}-w${{ matrix.sae_width }}-s${{ matrix.seed }}
           retention-days: 30
           if-no-files-found: error
