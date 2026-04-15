@@ -1,17 +1,5 @@
-name: Self-Contained LLM Scaling Sweep - M1 - Ultra Verbose - Reliability First
+name: Fully Self-Contained M1 Sweep
 
-# ============================================================
-# TRIGGERS
-# ============================================================
-# This workflow runs:
-# 1. On push to main/master when this workflow file changes
-# 2. On pull requests to main/master when this workflow file changes
-# 3. Manually via workflow_dispatch
-#
-# The narrow path filter is intentional:
-# - it keeps this workflow self-contained
-# - it prevents accidental runs from unrelated repo changes
-# ============================================================
 on:
   push:
     branches:
@@ -30,7 +18,7 @@ on:
   workflow_dispatch:
     inputs:
       sweep_mode:
-        description: "Sweep mode to run"
+        description: "Sweep mode"
         required: false
         default: "small-only"
         type: choice
@@ -38,63 +26,28 @@ on:
           - small-only
           - robustness-only
           - full
-
       max_parallel:
-        description: "Maximum number of matrix jobs to run in parallel"
+        description: "Maximum parallel matrix jobs"
         required: false
         default: "2"
         type: string
 
-# ============================================================
-# PERMISSIONS
-# ============================================================
-# Minimal permissions for safety and predictability.
-# ============================================================
 permissions:
   contents: read
   actions: read
   checks: write
   pull-requests: read
 
-# ============================================================
-# CONCURRENCY
-# ============================================================
-# Prevent overlapping runs for the same branch/ref.
-# If you push multiple times quickly, older in-progress runs
-# are cancelled.
-# ============================================================
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# ============================================================
-# JOBS
-# ============================================================
 jobs:
-  small-scale-sweep:
-    name: Sweep - ${{ matrix.model }} - width=${{ matrix.sae_width }} - seed=${{ matrix.seed }}
-
-    # --------------------------------------------------------
-    # RUNNER
-    # --------------------------------------------------------
-    # macos-14 is the GitHub-hosted Apple Silicon runner target
-    # you asked for.
-    # --------------------------------------------------------
+  self-contained-sweep:
+    name: Sweep - ${{ matrix.model }} - w${{ matrix.sae_width }} - s${{ matrix.seed }}
     runs-on: macos-14
-
-    # --------------------------------------------------------
-    # TIMEOUT
-    # --------------------------------------------------------
-    # Keep a hard upper bound so hung jobs do not burn minutes.
-    # --------------------------------------------------------
     timeout-minutes: 45
 
-    # --------------------------------------------------------
-    # MATRIX
-    # --------------------------------------------------------
-    # Small, reliable matrix for hosted M1 execution.
-    # You can expand later after it is stable.
-    # --------------------------------------------------------
     strategy:
       fail-fast: false
       max-parallel: ${{ fromJSON(github.event.inputs.max_parallel || '2') }}
@@ -109,50 +62,24 @@ jobs:
           - 1
           - 2
 
-    # --------------------------------------------------------
-    # STATIC ENVIRONMENT
-    # --------------------------------------------------------
-    # These are safe to keep at job scope because they are not
-    # used as fragile path transport between steps.
-    # --------------------------------------------------------
     env:
       PYTHON_VERSION: "3.12"
       SWEEP_MODE: ${{ github.event.inputs.sweep_mode || 'small-only' }}
       SWEEP_TRACKS: "polysemanticity,circuit_faithfulness,robustness_gap"
 
     steps:
-      # ======================================================
-      # STEP 1: CHECKOUT
-      # ======================================================
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      # ======================================================
-      # STEP 2: SET UP PYTHON
-      # ======================================================
-      - name: Set up Python ${{ env.PYTHON_VERSION }}
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
 
-      # ======================================================
-      # STEP 3: SHOW CORE RUNNER INFO
-      # ======================================================
-      # This is intentionally verbose for debugging.
-      # It helps confirm:
-      # - platform
-      # - architecture
-      # - workspace
-      # - matrix values
-      # - mode selection
-      # ======================================================
-      - name: Print runner and job context
+      - name: Print runner info
         run: |
           echo "=================================================="
-          echo "RUNNER / JOB CONTEXT"
+          echo "RUNNER INFO"
           echo "=================================================="
-          echo "Workflow name: ${{ github.workflow }}"
+          echo "Workflow: ${{ github.workflow }}"
           echo "Run ID: ${{ github.run_id }}"
           echo "Run attempt: ${{ github.run_attempt }}"
           echo "Repository: ${{ github.repository }}"
@@ -160,93 +87,44 @@ jobs:
           echo "Actor: ${{ github.actor }}"
           echo "Workspace: ${{ github.workspace }}"
           echo "Runner OS: ${RUNNER_OS}"
-          echo "Current directory:"
+          echo "Model: ${{ matrix.model }}"
+          echo "SAE width: ${{ matrix.sae_width }}"
+          echo "Seed: ${{ matrix.seed }}"
+          echo "Sweep mode: ${{ env.SWEEP_MODE }}"
+          echo "Tracks: ${{ env.SWEEP_TRACKS }}"
           pwd
-          echo "Directory contents:"
-          ls -la
-          echo "Selected matrix model: ${{ matrix.model }}"
-          echo "Selected matrix sae_width: ${{ matrix.sae_width }}"
-          echo "Selected matrix seed: ${{ matrix.seed }}"
-          echo "Selected sweep mode: ${{ env.SWEEP_MODE }}"
-          echo "Selected sweep tracks: ${{ env.SWEEP_TRACKS }}"
-          echo "=================================================="
-          echo "Kernel / machine info:"
           uname -a
-          echo "=================================================="
+          ls -la "${{ github.workspace }}"
 
-      # ======================================================
-      # STEP 4: INSTALL PYTHON DEPENDENCIES
-      # ======================================================
-      # Keep dependencies minimal and explicit.
-      # No external model downloads. No auth required.
-      # ======================================================
-      - name: Install Python dependencies
+      - name: Install dependencies
         run: |
           echo "=================================================="
-          echo "INSTALLING PYTHON DEPENDENCIES"
+          echo "INSTALL DEPENDENCIES"
           echo "=================================================="
           python -m pip install --upgrade pip setuptools wheel
-          pip --version
-          python --version
           pip install numpy pandas matplotlib plotly
-          echo "=================================================="
-          echo "INSTALLED PACKAGES"
-          echo "=================================================="
+          python --version
+          pip --version
           pip list | grep -E 'numpy|pandas|matplotlib|plotly' || true
-          echo "=================================================="
 
-      # ======================================================
-      # STEP 5: PREPARE OUTPUT DIRECTORY
-      # ======================================================
-      # This is one of the most important reliability steps.
-      #
-      # We do NOT depend on environment propagation for this path.
-      # We write directly to a literal absolute path under
-      # github.workspace.
-      #
-      # We also create a placeholder file immediately so that
-      # upload-artifact always has something to find, even if
-      # the sweep fails later.
-      # ======================================================
-      - name: Prepare deterministic artifact directory
+      - name: Prepare artifact directory
         run: |
           echo "=================================================="
-          echo "PREPARING ARTIFACT DIRECTORY"
+          echo "PREPARE ARTIFACT DIRECTORY"
           echo "=================================================="
-
           mkdir -p "${{ github.workspace }}/artifacts/${{ matrix.model }}-w${{ matrix.sae_width }}-s${{ matrix.seed }}"
-
-          echo "This file is created before the sweep starts so the artifact directory is never empty." \
-            > "${{ github.workspace }}/artifacts/${{ matrix.model }}-w${{ matrix.sae_width }}-s${{ matrix.seed }}/artifact_placeholder.txt"
-
-          echo "Artifact directory prepared:"
-          echo "${{ github.workspace }}/artifacts/${{ matrix.model }}-w${{ matrix.sae_width }}-s${{ matrix.seed }}"
-          echo "Contents:"
+          cat > "${{ github.workspace }}/artifacts/${{ matrix.model }}-w${{ matrix.sae_width }}-s${{ matrix.seed }}/artifact_placeholder.txt" <<'EOF'
+          This placeholder is created before the sweep starts.
+          It guarantees the artifact directory exists and is not empty.
+          EOF
           ls -la "${{ github.workspace }}/artifacts/${{ matrix.model }}-w${{ matrix.sae_width }}-s${{ matrix.seed }}"
-          echo "=================================================="
 
-      # ======================================================
-      # STEP 6: WRITE SELF-CONTAINED PYTHON SCRIPT
-      # ======================================================
-      # This script:
-      # - creates synthetic benchmark data
-      # - writes CSV output
-      # - writes aggregated CSV
-      # - writes markdown summary
-      # - writes PNG plots
-      # - writes HTML plot
-      # - writes metadata JSON
-      #
-      # It has no external API dependencies and no need for
-      # repo-side Python files.
-      # ======================================================
-      - name: Write inline sweep script
+      - name: Write fully self-contained sweep script
         run: |
           echo "=================================================="
-          echo "WRITING INLINE PYTHON SWEEP SCRIPT"
+          echo "WRITE INLINE SCRIPT"
           echo "=================================================="
-
-          cat > sweep_inline.py <<'PY'
+          cat > "${{ github.workspace }}/sweep_inline.py" <<'PY'
           import argparse
           import json
           import math
@@ -309,30 +187,32 @@ jobs:
 
 
           def write_summary(df: pd.DataFrame, outdir: Path, model: str, sae_width: int, seed: int, mode: str):
-              summary_lines = []
-              summary_lines.append("# Sweep Summary")
-              summary_lines.append("")
-              summary_lines.append(f"- Model: `{model}`")
-              summary_lines.append(f"- SAE width: `{sae_width}`")
-              summary_lines.append(f"- Seed: `{seed}`")
-              summary_lines.append(f"- Mode: `{mode}`")
-              summary_lines.append(f"- Row count: `{len(df)}`")
-              summary_lines.append("")
+              lines = [
+                  "# Sweep Summary",
+                  "",
+                  f"- Model: `{model}`",
+                  f"- SAE width: `{sae_width}`",
+                  f"- Seed: `{seed}`",
+                  f"- Mode: `{mode}`",
+                  f"- Rows: `{len(df)}`",
+                  "",
+              ]
 
               if len(df) == 0:
-                  summary_lines.append("No rows were generated.")
+                  lines.append("No rows generated.")
               else:
                   for track in sorted(df["track"].unique()):
-                      track_mean = float(df.loc[df["track"] == track, "value"].mean())
-                      summary_lines.append(f"## {track}")
-                      summary_lines.append(f"- Mean value: `{track_mean:.4f}`")
+                      track_df = df[df["track"] == track]
+                      mean_value = float(track_df["value"].mean())
+                      lines.append(f"## {track}")
+                      lines.append(f"- Mean value: `{mean_value:.4f}`")
                       if track in ("polysemanticity", "circuit_faithfulness"):
-                          summary_lines.append("- Interpretation: higher is better")
+                          lines.append("- Interpretation: higher is better")
                       else:
-                          summary_lines.append("- Interpretation: lower is better")
-                      summary_lines.append("")
+                          lines.append("- Interpretation: lower is better")
+                      lines.append("")
 
-              (outdir / "sweep_summary.md").write_text("\n".join(summary_lines), encoding="utf-8")
+              (outdir / "sweep_summary.md").write_text("\n".join(lines), encoding="utf-8")
 
 
           def write_plots(df: pd.DataFrame, outdir: Path):
@@ -341,7 +221,6 @@ jobs:
 
               for track in sorted(df["track"].unique()):
                   sub = df[df["track"] == track].copy()
-
                   plt.figure(figsize=(8, 5))
                   plt.plot(range(len(sub)), sub["value"].tolist(), marker="o")
                   plt.title(f"{track} values")
@@ -363,7 +242,7 @@ jobs:
 
 
           def main():
-              parser = argparse.ArgumentParser(description="Self-contained synthetic sweep")
+              parser = argparse.ArgumentParser()
               parser.add_argument("--model", required=True)
               parser.add_argument("--sae-width", required=True, type=int)
               parser.add_argument("--seed", required=True, type=int)
@@ -410,43 +289,25 @@ jobs:
                   "mode": args.mode,
                   "tracks": tracks,
                   "rows": int(len(df)),
-                  "files_expected": [
-                      "artifact_placeholder.txt",
-                      "results.csv",
-                      "results_aggregated.csv",
-                      "sweep_summary.md",
-                      "metadata.json",
-                      "results.html",
-                  ],
+                  "cwd": str(Path.cwd()),
+                  "output_dir": str(outdir),
               }
 
               (outdir / "metadata.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
-
-              print("Synthetic sweep completed successfully.")
               print(json.dumps(payload, indent=2))
 
 
           if __name__ == "__main__":
               main()
           PY
+          ls -la "${{ github.workspace }}/sweep_inline.py"
 
-          echo "Inline script written."
-          ls -la sweep_inline.py
-          echo "=================================================="
-
-      # ======================================================
-      # STEP 7: RUN THE SWEEP
-      # ======================================================
-      # Uses a fully explicit output path.
-      # No fragile variable indirection.
-      # ======================================================
-      - name: Run synthetic sweep
+      - name: Run self-contained sweep
         run: |
           echo "=================================================="
-          echo "RUNNING SYNTHETIC SWEEP"
+          echo "RUN SWEEP"
           echo "=================================================="
-
-          python sweep_inline.py \
+          python "${{ github.workspace }}/sweep_inline.py" \
             --model "${{ matrix.model }}" \
             --sae-width "${{ matrix.sae_width }}" \
             --seed "${{ matrix.seed }}" \
@@ -454,47 +315,26 @@ jobs:
             --mode "${{ env.SWEEP_MODE }}" \
             --output-dir "${{ github.workspace }}/artifacts/${{ matrix.model }}-w${{ matrix.sae_width }}-s${{ matrix.seed }}"
 
-          echo "=================================================="
-          echo "SWEEP FINISHED"
-          echo "=================================================="
-
-      # ======================================================
-      # STEP 8: VERIFY OUTPUTS
-      # ======================================================
-      # This is the second most important reliability step.
-      #
-      # If the sweep failed early or did not create expected files,
-      # this step creates fallback files so artifact upload still
-      # succeeds and preserves debugging information.
-      # ======================================================
-      - name: Verify and repair artifact directory if needed
+      - name: Verify and repair outputs
         if: always()
         run: |
           echo "=================================================="
-          echo "VERIFYING ARTIFACT OUTPUTS"
+          echo "VERIFY AND REPAIR OUTPUTS"
           echo "=================================================="
-
           TARGET="${{ github.workspace }}/artifacts/${{ matrix.model }}-w${{ matrix.sae_width }}-s${{ matrix.seed }}"
-
-          echo "Target artifact directory:"
-          echo "${TARGET}"
+          echo "Target: ${TARGET}"
 
           if [ ! -d "${TARGET}" ]; then
-            echo "Artifact directory missing. Recreating it now."
             mkdir -p "${TARGET}"
           fi
 
           if [ ! -f "${TARGET}/artifact_placeholder.txt" ]; then
-            echo "Recreating placeholder file."
-            echo "placeholder recreated during verification" > "${TARGET}/artifact_placeholder.txt"
+            echo "placeholder recreated" > "${TARGET}/artifact_placeholder.txt"
           fi
 
           if [ ! -f "${TARGET}/results.csv" ]; then
-            echo "results.csv missing. Creating fallback files."
-            echo "fallback artifact because primary sweep output was missing" > "${TARGET}/fallback.txt"
-            echo '{"status":"fallback-created-during-verification"}' > "${TARGET}/metadata.json"
             echo "note,reason" > "${TARGET}/results.csv"
-            echo "fallback,primary output missing" >> "${TARGET}/results.csv"
+            echo "fallback,missing primary output" >> "${TARGET}/results.csv"
           fi
 
           if [ ! -f "${TARGET}/results_aggregated.csv" ]; then
@@ -510,60 +350,34 @@ jobs:
           EOF
           fi
 
-          echo "Final artifact directory contents:"
-          find "${TARGET}" -maxdepth 1 -type f | sort
+          if [ ! -f "${TARGET}/metadata.json" ]; then
+            cat > "${TARGET}/metadata.json" <<'EOF'
+          {
+            "status": "fallback-created-during-verification"
+          }
+          EOF
+          fi
 
-          echo "Long listing:"
+          find "${TARGET}" -maxdepth 1 -type f | sort
           ls -la "${TARGET}"
 
-          echo "=================================================="
-
-      # ======================================================
-      # STEP 9: PRINT FILE CONTENT PREVIEW
-      # ======================================================
-      # Helpful when debugging uploads.
-      # ======================================================
-      - name: Preview generated files
+      - name: Preview outputs
         if: always()
         run: |
           echo "=================================================="
-          echo "PREVIEWING GENERATED FILES"
+          echo "PREVIEW OUTPUTS"
           echo "=================================================="
-
           TARGET="${{ github.workspace }}/artifacts/${{ matrix.model }}-w${{ matrix.sae_width }}-s${{ matrix.seed }}"
 
           echo "--- metadata.json ---"
-          if [ -f "${TARGET}/metadata.json" ]; then
-            cat "${TARGET}/metadata.json"
-          else
-            echo "metadata.json missing"
-          fi
+          cat "${TARGET}/metadata.json" || true
 
           echo "--- results.csv ---"
-          if [ -f "${TARGET}/results.csv" ]; then
-            head -n 20 "${TARGET}/results.csv"
-          else
-            echo "results.csv missing"
-          fi
+          head -n 20 "${TARGET}/results.csv" || true
 
           echo "--- sweep_summary.md ---"
-          if [ -f "${TARGET}/sweep_summary.md" ]; then
-            cat "${TARGET}/sweep_summary.md"
-          else
-            echo "sweep_summary.md missing"
-          fi
+          cat "${TARGET}/sweep_summary.md" || true
 
-          echo "=================================================="
-
-      # ======================================================
-      # STEP 10: UPLOAD ARTIFACTS
-      # ======================================================
-      # Upload a single deterministic directory path rooted under
-      # github.workspace.
-      #
-      # This is the safest pattern and avoids the issues you hit
-      # with empty shell variables.
-      # ======================================================
       - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -573,18 +387,11 @@ jobs:
           retention-days: 30
           if-no-files-found: error
 
-      # ======================================================
-      # STEP 11: FINAL SUCCESS LOG
-      # ======================================================
-      - name: Final status message
+      - name: Final status
         if: always()
         run: |
           echo "=================================================="
           echo "JOB COMPLETE"
           echo "=================================================="
-          echo "Model: ${{ matrix.model }}"
-          echo "SAE width: ${{ matrix.sae_width }}"
-          echo "Seed: ${{ matrix.seed }}"
-          echo "Artifacts directory:"
+          echo "Artifact path:"
           echo "${{ github.workspace }}/artifacts/${{ matrix.model }}-w${{ matrix.sae_width }}-s${{ matrix.seed }}"
-          echo "=================================================="
