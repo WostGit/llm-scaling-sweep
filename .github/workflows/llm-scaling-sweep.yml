@@ -1,4 +1,4 @@
-name: Self-Contained LLM Scaling Sweep (M1, No API Keys, Reliable Artifacts)
+name: Self-Contained LLM Scaling Sweep (M1, No API Keys, Fixed Artifacts)
 
 on:
   push:
@@ -70,17 +70,11 @@ jobs:
           python -m pip install --upgrade pip setuptools wheel
           pip install numpy pandas matplotlib plotly
 
-      - name: Define output path
+      - name: Prepare artifact directory
         run: |
-          ARTIFACT_DIR="${GITHUB_WORKSPACE}/artifacts/${{ matrix.model }}-w${{ matrix.sae_width }}-s${{ matrix.seed }}"
-          mkdir -p "${ARTIFACT_DIR}"
-          echo "ARTIFACT_DIR=${ARTIFACT_DIR}" >> "$GITHUB_ENV"
-
-          # Create a guaranteed starter file immediately
-          echo "placeholder" > "${ARTIFACT_DIR}/artifact_placeholder.txt"
-
-          echo "Using artifact dir: ${ARTIFACT_DIR}"
-          ls -la "${ARTIFACT_DIR}"
+          mkdir -p "${{ github.workspace }}/artifacts/${{ matrix.model }}-w${{ matrix.sae_width }}-s${{ matrix.seed }}"
+          echo "placeholder" > "${{ github.workspace }}/artifacts/${{ matrix.model }}-w${{ matrix.sae_width }}-s${{ matrix.seed }}/artifact_placeholder.txt"
+          ls -la "${{ github.workspace }}/artifacts/${{ matrix.model }}-w${{ matrix.sae_width }}-s${{ matrix.seed }}"
 
       - name: Verify runner
         run: |
@@ -90,8 +84,7 @@ jobs:
           print("Python:", sys.version)
           print("Platform:", platform.platform())
           print("Machine:", platform.machine())
-          print("GITHUB_WORKSPACE:", os.environ.get("GITHUB_WORKSPACE"))
-          print("ARTIFACT_DIR:", os.environ.get("ARTIFACT_DIR"))
+          print("Workspace:", os.environ.get("GITHUB_WORKSPACE"))
           PY
 
       - name: Write self-contained sweep script
@@ -230,23 +223,23 @@ jobs:
             --seed "${{ matrix.seed }}" \
             --tracks "${{ env.SWEEP_TRACKS }}" \
             --mode "${{ env.SWEEP_MODE }}" \
-            --output-dir "${ARTIFACT_DIR}"
+            --output-dir "${{ github.workspace }}/artifacts/${{ matrix.model }}-w${{ matrix.sae_width }}-s${{ matrix.seed }}"
 
       - name: Verify artifact files
         if: always()
         run: |
-          echo "Artifact directory: ${ARTIFACT_DIR}"
-          test -d "${ARTIFACT_DIR}"
+          TARGET="${{ github.workspace }}/artifacts/${{ matrix.model }}-w${{ matrix.sae_width }}-s${{ matrix.seed }}"
+          echo "Artifact directory: ${TARGET}"
+          test -d "${TARGET}"
 
-          # Create guaranteed fallback files if sweep failed early
-          if [ ! -f "${ARTIFACT_DIR}/results.csv" ]; then
+          if [ ! -f "${TARGET}/results.csv" ]; then
             echo "Sweep output missing; writing fallback files"
-            echo "fallback artifact" > "${ARTIFACT_DIR}/fallback.txt"
-            echo '{"status":"fallback"}' > "${ARTIFACT_DIR}/metadata.json"
+            echo "fallback artifact" > "${TARGET}/fallback.txt"
+            echo '{"status":"fallback"}' > "${TARGET}/metadata.json"
           fi
 
           echo "Contents:"
-          find "${ARTIFACT_DIR}" -maxdepth 1 -type f | sort
+          find "${TARGET}" -maxdepth 1 -type f | sort
 
       - name: Upload artifacts
         if: always()
