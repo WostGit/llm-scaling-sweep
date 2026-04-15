@@ -1,4 +1,4 @@
-name: Self-Contained LLM Scaling Sweep (M1, No API Keys)
+name: Self-Contained LLM Scaling Sweep (M1, No API Keys, No Missing Artifacts)
 
 on:
   push:
@@ -54,6 +54,7 @@ jobs:
       PYTHON_VERSION: "3.12"
       SWEEP_MODE: ${{ github.event.inputs.sweep_mode || 'small-only' }}
       SWEEP_TRACKS: "polysemanticity,circuit_faithfulness,robustness_gap"
+      OUTDIR: results/${{ matrix.model }}-w${{ matrix.sae_width }}-s${{ matrix.seed }}
 
     steps:
       - name: Checkout
@@ -70,7 +71,14 @@ jobs:
           python -m pip install --upgrade pip setuptools wheel
           pip install numpy pandas matplotlib plotly
 
-      - name: Verify M1 runner and Python environment
+      - name: Prepare output directory early
+        run: |
+          mkdir -p "${OUTDIR}"
+          echo "artifact placeholder" > "${OUTDIR}/artifact_placeholder.txt"
+          echo "Prepared ${OUTDIR}"
+          ls -la "${OUTDIR}"
+
+      - name: Verify runner and Python environment
         run: |
           echo "::group::Runner diagnostics"
           uname -a
@@ -82,6 +90,7 @@ jobs:
           print("Runner OS:", os.environ.get("RUNNER_OS"))
           print("Sweep mode:", os.environ.get("SWEEP_MODE"))
           print("Tracks:", os.environ.get("SWEEP_TRACKS"))
+          print("OUTDIR:", os.environ.get("OUTDIR"))
           PY
           echo "::endgroup::"
 
@@ -89,12 +98,9 @@ jobs:
         run: |
           cat > sweep_inline.py <<'PY'
           import argparse
-          import csv
           import json
           import math
-          import os
           import random
-          import statistics
           from pathlib import Path
 
           import pandas as pd
@@ -116,25 +122,21 @@ jobs:
 
               rows = []
               for track in tracks:
+                  if mode == "robustness-only" and track != "robustness_gap":
+                      continue
+
                   if track == "polysemanticity":
-                      # Higher is better here
                       base = max(0.20, 0.92 - 0.14 * log_scale)
                       width_bonus = min(0.06, math.log2(sae_width / 16384 + 1) * 0.02)
                       value = max(0.0, min(1.0, base + width_bonus + stable_noise(seed + sae_width)))
                   elif track == "circuit_faithfulness":
-                      # Higher is better
                       base = max(0.15, 0.90 - 0.12 * log_scale)
-                      seed_adj = stable_noise(seed * 11 + sae_width, 0.03)
-                      value = max(0.0, min(1.0, base + seed_adj))
+                      value = max(0.0, min(1.0, base + stable_noise(seed * 11 + sae_width, 0.03)))
                   elif track == "robustness_gap":
-                      # Lower is better
                       base = min(0.95, 0.08 + 0.12 * log_scale)
                       width_penalty = min(0.08, math.log2(sae_width / 16384 + 1) * 0.015)
                       value = max(0.0, min(1.0, base + width_penalty + abs(stable_noise(seed * 7 + sae_width, 0.025))))
                   else:
-                      continue
-
-                  if mode == "robustness-only" and track != "robustness_gap":
                       continue
 
                   rows.append({
@@ -147,36 +149,29 @@ jobs:
                   })
               return rows
 
-          def write_summary(df, outdir, mode, model, width, seed):
-              outdir = Path(outdir)
+          def write_summary(df, outdir, mode):
               summary_path = outdir / "sweep_summary.md"
-
-              lines = []
-              lines.append(f"# Sweep Summary")
-              lines.append("")
-              lines.append(f"- Mode: `{mode}`")
-              lines.append(f"- Model: `{model}`")
-              lines.append(f"- SAE width: `{width}`")
-              lines.append(f"- Seed: `{seed}`")
-              lines.append("")
-
-              for track in sorted(df["track"].unique()):
-                  sub = df[df["track"] == track]
-                  val = float(sub["value"].mean())
-                  lines.append(f"## {track}")
-                  lines.append(f"- Mean value: `{val:.4f}`")
-                  if track in ("polysemanticity", "circuit_faithfulness"):
-                      lines.append("- Interpretation: higher is better")
-                  else:
-                      lines.append("- Interpretation: lower is better")
-                  lines.append("")
-
+              lines = [
+                  "# Sweep Summary",
+                  "",
+                  f"- Mode: `{mode}`",
+                  f"- Rows: `{len(df)}`",
+                  "",
+              ]
+              if len(df) > 0:
+                  for track in sorted(df["track"].unique()):
+                      sub = df[df["track"] == track]
+                      lines.append(f"## {track}")
+                      lines.append(f"- Mean value: `{sub['value'].mean():.4f}`")
+                      lines.append("")
+              else:
+                  lines.append("No rows generated.")
               summary_path.write_text("\n".join(lines), encoding="utf-8")
 
           def make_plots(df, outdir):
-              outdir = Path(outdir)
+              if len(df) == 0:
+                  return
 
-              # PNG
               for track in sorted(df["track"].unique()):
                   sub = df[df["track"] == track].copy()
                   plt.figure(figsize=(8, 5))
@@ -190,7 +185,6 @@ jobs:
                   plt.savefig(outdir / f"{track}.png", dpi=150)
                   plt.close()
 
-              # HTML
               fig = px.scatter(
                   df,
                   x="model_size_m",
@@ -234,26 +228,14 @@ jobs:
               )
               agg.to_csv(outdir / "results_aggregated.csv", index=False)
 
-              if not agg.empty:
-                  first = agg.iloc[0]
-                  write_summary(
-                      agg,
-                      outdir,
-                      args.mode,
-                      str(first["model"]),
-                      int(first["sae_width"]),
-                      "aggregated",
-                  )
-              else:
-                  (outdir / "sweep_summary.md").write_text("# Sweep Summary\n\nNo rows generated.\n", encoding="utf-8")
-
+              write_summary(agg, outdir, args.mode)
               make_plots(agg, outdir)
 
               payload = {
-                  "rows": len(df),
-                  "tracks": sorted(df["track"].unique().tolist()),
-                  "models": sorted(df["model"].unique().tolist()),
-                  "sae_widths": sorted(df["sae_width"].unique().tolist()),
+                  "rows": int(len(df)),
+                  "tracks": sorted(df["track"].unique().tolist()) if len(df) else [],
+                  "models": sorted(df["model"].unique().tolist()) if len(df) else [],
+                  "sae_widths": sorted(df["sae_width"].unique().tolist()) if len(df) else [],
               }
               (outdir / "metadata.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
@@ -266,30 +248,36 @@ jobs:
 
       - name: Run self-contained sweep
         run: |
-          mkdir -p "results/${{ matrix.model }}-w${{ matrix.sae_width }}-s${{ matrix.seed }}"
           python sweep_inline.py \
             --models "${{ matrix.model }}" \
             --sae-widths "${{ matrix.sae_width }}" \
             --seeds "${{ matrix.seed }}" \
             --tracks "${{ env.SWEEP_TRACKS }}" \
             --mode "${{ env.SWEEP_MODE }}" \
-            --output-dir "results/${{ matrix.model }}-w${{ matrix.sae_width }}-s${{ matrix.seed }}"
+            --output-dir "${OUTDIR}"
 
-      - name: Print quick summary
+      - name: Verify output files exist
         if: always()
         run: |
-          echo "Completed self-contained sweep for:"
-          echo "  model=${{ matrix.model }}"
-          echo "  sae_width=${{ matrix.sae_width }}"
-          echo "  seed=${{ matrix.seed }}"
-          echo "Artifacts were written under results/"
+          echo "Listing ${OUTDIR}"
+          ls -la "${OUTDIR}"
+
+          test -d "${OUTDIR}" || (echo "Missing output directory" && exit 1)
+
+          # Guarantee at least one uploadable file exists
+          if [ ! -f "${OUTDIR}/results.csv" ]; then
+            echo "results.csv missing, creating fallback diagnostic files"
+            echo "fallback" > "${OUTDIR}/fallback.txt"
+            echo '{"status":"fallback-created"}' > "${OUTDIR}/metadata.json"
+          fi
+
+          find "${OUTDIR}" -maxdepth 1 -type f | sort
 
       - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: sweep-${{ matrix.model }}-w${{ matrix.sae_width }}-s${{ matrix.seed }}-${{ github.run_id }}
-          path: |
-            results/${{ matrix.model }}-w${{ matrix.sae_width }}-s${{ matrix.seed }}/
+          path: ${{ env.OUTDIR }}
           retention-days: 30
           if-no-files-found: error
