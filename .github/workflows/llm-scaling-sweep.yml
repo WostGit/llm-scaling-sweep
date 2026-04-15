@@ -1,0 +1,295 @@
+name: Self-Contained LLM Scaling Sweep (M1, No API Keys)
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - ".github/workflows/llm-scaling-sweep.yml"
+  pull_request:
+    branches: [main, master]
+    paths:
+      - ".github/workflows/llm-scaling-sweep.yml"
+  workflow_dispatch:
+    inputs:
+      sweep_mode:
+        description: "Sweep mode"
+        required: false
+        default: "small-only"
+        type: choice
+        options:
+          - small-only
+          - robustness-only
+          - full
+      max_parallel:
+        description: "Maximum parallel matrix jobs"
+        required: false
+        default: "3"
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+  checks: write
+  pull-requests: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  small-scale-sweep:
+    name: Sweep - ${{ matrix.model }} / width=${{ matrix.sae_width }} / seed=${{ matrix.seed }}
+    runs-on: macos-14
+    timeout-minutes: 60
+
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJSON(github.event.inputs.max_parallel || '3') }}
+      matrix:
+        model: [tiny-160m, mid-1.4b]
+        sae_width: [16384, 65536]
+        seed: [1, 2]
+
+    env:
+      PYTHON_VERSION: "3.12"
+      SWEEP_MODE: ${{ github.event.inputs.sweep_mode || 'small-only' }}
+      SWEEP_TRACKS: "polysemanticity,circuit_faithfulness,robustness_gap"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          pip install numpy pandas matplotlib plotly
+
+      - name: Verify M1 runner and Python environment
+        run: |
+          echo "::group::Runner diagnostics"
+          uname -a
+          python - <<'PY'
+          import platform, sys, os
+          print("Python:", sys.version)
+          print("Platform:", platform.platform())
+          print("Machine:", platform.machine())
+          print("Runner OS:", os.environ.get("RUNNER_OS"))
+          print("Sweep mode:", os.environ.get("SWEEP_MODE"))
+          print("Tracks:", os.environ.get("SWEEP_TRACKS"))
+          PY
+          echo "::endgroup::"
+
+      - name: Write self-contained sweep script
+        run: |
+          cat > sweep_inline.py <<'PY'
+          import argparse
+          import csv
+          import json
+          import math
+          import os
+          import random
+          import statistics
+          from pathlib import Path
+
+          import pandas as pd
+          import matplotlib.pyplot as plt
+          import plotly.express as px
+
+          def stable_noise(seed, scale=0.02):
+              rng = random.Random(seed)
+              return (rng.random() - 0.5) * 2 * scale
+
+          def synthetic_metrics(model, sae_width, seed, tracks, mode):
+              model_size_map = {
+                  "tiny-160m": 160,
+                  "mid-1.4b": 1400,
+                  "large-6.9b-proxy": 6900,
+              }
+              size_m = model_size_map.get(model, 160)
+              log_scale = math.log10(size_m)
+
+              rows = []
+              for track in tracks:
+                  if track == "polysemanticity":
+                      # Higher is better here
+                      base = max(0.20, 0.92 - 0.14 * log_scale)
+                      width_bonus = min(0.06, math.log2(sae_width / 16384 + 1) * 0.02)
+                      value = max(0.0, min(1.0, base + width_bonus + stable_noise(seed + sae_width)))
+                  elif track == "circuit_faithfulness":
+                      # Higher is better
+                      base = max(0.15, 0.90 - 0.12 * log_scale)
+                      seed_adj = stable_noise(seed * 11 + sae_width, 0.03)
+                      value = max(0.0, min(1.0, base + seed_adj))
+                  elif track == "robustness_gap":
+                      # Lower is better
+                      base = min(0.95, 0.08 + 0.12 * log_scale)
+                      width_penalty = min(0.08, math.log2(sae_width / 16384 + 1) * 0.015)
+                      value = max(0.0, min(1.0, base + width_penalty + abs(stable_noise(seed * 7 + sae_width, 0.025))))
+                  else:
+                      continue
+
+                  if mode == "robustness-only" and track != "robustness_gap":
+                      continue
+
+                  rows.append({
+                      "model": model,
+                      "model_size_m": size_m,
+                      "sae_width": sae_width,
+                      "seed": seed,
+                      "track": track,
+                      "value": round(value, 6),
+                  })
+              return rows
+
+          def write_summary(df, outdir, mode, model, width, seed):
+              outdir = Path(outdir)
+              summary_path = outdir / "sweep_summary.md"
+
+              lines = []
+              lines.append(f"# Sweep Summary")
+              lines.append("")
+              lines.append(f"- Mode: `{mode}`")
+              lines.append(f"- Model: `{model}`")
+              lines.append(f"- SAE width: `{width}`")
+              lines.append(f"- Seed: `{seed}`")
+              lines.append("")
+
+              for track in sorted(df["track"].unique()):
+                  sub = df[df["track"] == track]
+                  val = float(sub["value"].mean())
+                  lines.append(f"## {track}")
+                  lines.append(f"- Mean value: `{val:.4f}`")
+                  if track in ("polysemanticity", "circuit_faithfulness"):
+                      lines.append("- Interpretation: higher is better")
+                  else:
+                      lines.append("- Interpretation: lower is better")
+                  lines.append("")
+
+              summary_path.write_text("\n".join(lines), encoding="utf-8")
+
+          def make_plots(df, outdir):
+              outdir = Path(outdir)
+
+              # PNG
+              for track in sorted(df["track"].unique()):
+                  sub = df[df["track"] == track].copy()
+                  plt.figure(figsize=(8, 5))
+                  x = [str(x) for x in sub["sae_width"]]
+                  y = sub["value"].tolist()
+                  plt.plot(x, y, marker="o")
+                  plt.title(f"{track} by SAE width")
+                  plt.xlabel("SAE width")
+                  plt.ylabel("value")
+                  plt.tight_layout()
+                  plt.savefig(outdir / f"{track}.png", dpi=150)
+                  plt.close()
+
+              # HTML
+              fig = px.scatter(
+                  df,
+                  x="model_size_m",
+                  y="value",
+                  color="track",
+                  symbol="track",
+                  hover_data=["model", "sae_width", "seed"],
+                  title="Synthetic scaling sweep results",
+                  log_x=True,
+              )
+              fig.write_html(str(outdir / "results.html"))
+
+          def main():
+              parser = argparse.ArgumentParser()
+              parser.add_argument("--models", nargs="+", required=True)
+              parser.add_argument("--sae-widths", nargs="+", type=int, required=True)
+              parser.add_argument("--seeds", nargs="+", type=int, required=True)
+              parser.add_argument("--tracks", default="polysemanticity,circuit_faithfulness,robustness_gap")
+              parser.add_argument("--output-dir", required=True)
+              parser.add_argument("--mode", default="small-only")
+              args = parser.parse_args()
+
+              outdir = Path(args.output_dir)
+              outdir.mkdir(parents=True, exist_ok=True)
+
+              tracks = [x.strip() for x in args.tracks.split(",") if x.strip()]
+              rows = []
+
+              for model in args.models:
+                  for width in args.sae_widths:
+                      for seed in args.seeds:
+                          rows.extend(synthetic_metrics(model, width, seed, tracks, args.mode))
+
+              df = pd.DataFrame(rows)
+              df.to_csv(outdir / "results.csv", index=False)
+
+              agg = (
+                  df.groupby(["model", "model_size_m", "sae_width", "track"], as_index=False)["value"]
+                  .mean()
+                  .sort_values(["model_size_m", "sae_width", "track"])
+              )
+              agg.to_csv(outdir / "results_aggregated.csv", index=False)
+
+              if not agg.empty:
+                  first = agg.iloc[0]
+                  write_summary(
+                      agg,
+                      outdir,
+                      args.mode,
+                      str(first["model"]),
+                      int(first["sae_width"]),
+                      "aggregated",
+                  )
+              else:
+                  (outdir / "sweep_summary.md").write_text("# Sweep Summary\n\nNo rows generated.\n", encoding="utf-8")
+
+              make_plots(agg, outdir)
+
+              payload = {
+                  "rows": len(df),
+                  "tracks": sorted(df["track"].unique().tolist()),
+                  "models": sorted(df["model"].unique().tolist()),
+                  "sae_widths": sorted(df["sae_width"].unique().tolist()),
+              }
+              (outdir / "metadata.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+              print("Completed synthetic sweep.")
+              print(json.dumps(payload, indent=2))
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+      - name: Run self-contained sweep
+        run: |
+          mkdir -p "results/${{ matrix.model }}-w${{ matrix.sae_width }}-s${{ matrix.seed }}"
+          python sweep_inline.py \
+            --models "${{ matrix.model }}" \
+            --sae-widths "${{ matrix.sae_width }}" \
+            --seeds "${{ matrix.seed }}" \
+            --tracks "${{ env.SWEEP_TRACKS }}" \
+            --mode "${{ env.SWEEP_MODE }}" \
+            --output-dir "results/${{ matrix.model }}-w${{ matrix.sae_width }}-s${{ matrix.seed }}"
+
+      - name: Print quick summary
+        if: always()
+        run: |
+          echo "Completed self-contained sweep for:"
+          echo "  model=${{ matrix.model }}"
+          echo "  sae_width=${{ matrix.sae_width }}"
+          echo "  seed=${{ matrix.seed }}"
+          echo "Artifacts were written under results/"
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sweep-${{ matrix.model }}-w${{ matrix.sae_width }}-s${{ matrix.seed }}-${{ github.run_id }}
+          path: |
+            results/${{ matrix.model }}-w${{ matrix.sae_width }}-s${{ matrix.seed }}/
+          retention-days: 30
+          if-no-files-found: error
