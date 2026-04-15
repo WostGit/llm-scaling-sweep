@@ -1,4 +1,4 @@
-name: Fully Self-Contained M1 Sweep
+name: Fully Self Contained M1 Sweep Ultra Verbose
 
 on:
   push:
@@ -26,8 +26,9 @@ on:
           - small-only
           - robustness-only
           - full
+
       max_parallel:
-        description: "Maximum parallel matrix jobs"
+        description: "Maximum matrix jobs to run at once"
         required: false
         default: "2"
         type: string
@@ -68,16 +69,10 @@ jobs:
       SWEEP_TRACKS: "polysemanticity,circuit_faithfulness,robustness_gap"
 
     steps:
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          cache: pip
-
-      - name: Print runner info
+      - name: Show initial runner info
         run: |
           echo "=================================================="
-          echo "RUNNER INFO"
+          echo "INITIAL RUNNER INFO"
           echo "=================================================="
           echo "Workflow: ${{ github.workflow }}"
           echo "Run ID: ${{ github.run_id }}"
@@ -87,42 +82,83 @@ jobs:
           echo "Actor: ${{ github.actor }}"
           echo "Workspace: ${{ github.workspace }}"
           echo "Runner OS: ${RUNNER_OS}"
-          echo "Model: ${{ matrix.model }}"
-          echo "SAE width: ${{ matrix.sae_width }}"
-          echo "Seed: ${{ matrix.seed }}"
+          echo "Matrix model: ${{ matrix.model }}"
+          echo "Matrix sae_width: ${{ matrix.sae_width }}"
+          echo "Matrix seed: ${{ matrix.seed }}"
           echo "Sweep mode: ${{ env.SWEEP_MODE }}"
-          echo "Tracks: ${{ env.SWEEP_TRACKS }}"
+          echo "Sweep tracks: ${{ env.SWEEP_TRACKS }}"
+          echo "Current directory:"
           pwd
+          echo "Workspace listing:"
+          ls -la "${{ github.workspace }}" || true
+          echo "Kernel info:"
           uname -a
-          ls -la "${{ github.workspace }}"
+          echo "=================================================="
 
-      - name: Install dependencies
+      - name: Set up Python without cache
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Verify Python installation
+        run: |
+          echo "=================================================="
+          echo "VERIFY PYTHON"
+          echo "=================================================="
+          which python
+          python --version
+          python - <<'PY'
+          import os
+          import platform
+          import sys
+
+          print("Python executable:", sys.executable)
+          print("Python version:", sys.version)
+          print("Platform:", platform.platform())
+          print("Machine:", platform.machine())
+          print("Workspace:", os.environ.get("GITHUB_WORKSPACE"))
+          PY
+          echo "=================================================="
+
+      - name: Install inline dependencies
         run: |
           echo "=================================================="
           echo "INSTALL DEPENDENCIES"
           echo "=================================================="
           python -m pip install --upgrade pip setuptools wheel
           pip install numpy pandas matplotlib plotly
-          python --version
-          pip --version
-          pip list | grep -E 'numpy|pandas|matplotlib|plotly' || true
+          echo "Installed dependency versions:"
+          python - <<'PY'
+          import numpy
+          import pandas
+          import matplotlib
+          import plotly
+          print("numpy", numpy.__version__)
+          print("pandas", pandas.__version__)
+          print("matplotlib", matplotlib.__version__)
+          print("plotly", plotly.__version__)
+          PY
+          echo "=================================================="
 
-      - name: Prepare artifact directory
+      - name: Create deterministic artifact directory before doing anything else
         run: |
           echo "=================================================="
-          echo "PREPARE ARTIFACT DIRECTORY"
+          echo "CREATE ARTIFACT DIRECTORY"
           echo "=================================================="
           mkdir -p "${{ github.workspace }}/artifacts/${{ matrix.model }}-w${{ matrix.sae_width }}-s${{ matrix.seed }}"
           cat > "${{ github.workspace }}/artifacts/${{ matrix.model }}-w${{ matrix.sae_width }}-s${{ matrix.seed }}/artifact_placeholder.txt" <<'EOF'
-          This placeholder is created before the sweep starts.
-          It guarantees the artifact directory exists and is not empty.
+          This placeholder file is created before the sweep runs.
+          Its only job is to guarantee that the artifact directory exists
+          and is never empty, even if a later step fails.
           EOF
+          echo "Artifact directory created successfully."
           ls -la "${{ github.workspace }}/artifacts/${{ matrix.model }}-w${{ matrix.sae_width }}-s${{ matrix.seed }}"
+          echo "=================================================="
 
-      - name: Write fully self-contained sweep script
+      - name: Write fully self contained inline sweep script
         run: |
           echo "=================================================="
-          echo "WRITE INLINE SCRIPT"
+          echo "WRITE INLINE PYTHON SCRIPT"
           echo "=================================================="
           cat > "${{ github.workspace }}/sweep_inline.py" <<'PY'
           import argparse
@@ -202,8 +238,8 @@ jobs:
                   lines.append("No rows generated.")
               else:
                   for track in sorted(df["track"].unique()):
-                      track_df = df[df["track"] == track]
-                      mean_value = float(track_df["value"].mean())
+                      sub = df[df["track"] == track]
+                      mean_value = float(sub["value"].mean())
                       lines.append(f"## {track}")
                       lines.append(f"- Mean value: `{mean_value:.4f}`")
                       if track in ("polysemanticity", "circuit_faithfulness"):
@@ -244,8 +280,8 @@ jobs:
           def main():
               parser = argparse.ArgumentParser()
               parser.add_argument("--model", required=True)
-              parser.add_argument("--sae-width", required=True, type=int)
-              parser.add_argument("--seed", required=True, type=int)
+              parser.add_argument("--sae-width", type=int, required=True)
+              parser.add_argument("--seed", type=int, required=True)
               parser.add_argument("--tracks", required=True)
               parser.add_argument("--mode", required=True)
               parser.add_argument("--output-dir", required=True)
@@ -289,7 +325,6 @@ jobs:
                   "mode": args.mode,
                   "tracks": tracks,
                   "rows": int(len(df)),
-                  "cwd": str(Path.cwd()),
                   "output_dir": str(outdir),
               }
 
@@ -300,12 +335,14 @@ jobs:
           if __name__ == "__main__":
               main()
           PY
+          echo "Inline script written."
           ls -la "${{ github.workspace }}/sweep_inline.py"
+          echo "=================================================="
 
-      - name: Run self-contained sweep
+      - name: Run inline sweep script
         run: |
           echo "=================================================="
-          echo "RUN SWEEP"
+          echo "RUN INLINE SWEEP"
           echo "=================================================="
           python "${{ github.workspace }}/sweep_inline.py" \
             --model "${{ matrix.model }}" \
@@ -314,35 +351,41 @@ jobs:
             --tracks "${{ env.SWEEP_TRACKS }}" \
             --mode "${{ env.SWEEP_MODE }}" \
             --output-dir "${{ github.workspace }}/artifacts/${{ matrix.model }}-w${{ matrix.sae_width }}-s${{ matrix.seed }}"
+          echo "=================================================="
 
-      - name: Verify and repair outputs
+      - name: Verify outputs and repair if necessary
         if: always()
         run: |
           echo "=================================================="
           echo "VERIFY AND REPAIR OUTPUTS"
           echo "=================================================="
           TARGET="${{ github.workspace }}/artifacts/${{ matrix.model }}-w${{ matrix.sae_width }}-s${{ matrix.seed }}"
-          echo "Target: ${TARGET}"
+          echo "Target directory: ${TARGET}"
 
           if [ ! -d "${TARGET}" ]; then
+            echo "Target directory missing. Recreating."
             mkdir -p "${TARGET}"
           fi
 
           if [ ! -f "${TARGET}/artifact_placeholder.txt" ]; then
-            echo "placeholder recreated" > "${TARGET}/artifact_placeholder.txt"
+            echo "Recreating placeholder file."
+            echo "placeholder recreated during verification" > "${TARGET}/artifact_placeholder.txt"
           fi
 
           if [ ! -f "${TARGET}/results.csv" ]; then
+            echo "Creating fallback results.csv"
             echo "note,reason" > "${TARGET}/results.csv"
-            echo "fallback,missing primary output" >> "${TARGET}/results.csv"
+            echo "fallback,primary output missing" >> "${TARGET}/results.csv"
           fi
 
           if [ ! -f "${TARGET}/results_aggregated.csv" ]; then
+            echo "Creating fallback results_aggregated.csv"
             echo "track,value" > "${TARGET}/results_aggregated.csv"
             echo "fallback,0" >> "${TARGET}/results_aggregated.csv"
           fi
 
           if [ ! -f "${TARGET}/sweep_summary.md" ]; then
+            echo "Creating fallback sweep_summary.md"
             cat > "${TARGET}/sweep_summary.md" <<'EOF'
           # Sweep Summary
 
@@ -351,6 +394,7 @@ jobs:
           fi
 
           if [ ! -f "${TARGET}/metadata.json" ]; then
+            echo "Creating fallback metadata.json"
             cat > "${TARGET}/metadata.json" <<'EOF'
           {
             "status": "fallback-created-during-verification"
@@ -358,14 +402,16 @@ jobs:
           EOF
           fi
 
+          echo "Final directory listing:"
           find "${TARGET}" -maxdepth 1 -type f | sort
           ls -la "${TARGET}"
+          echo "=================================================="
 
-      - name: Preview outputs
+      - name: Preview generated files
         if: always()
         run: |
           echo "=================================================="
-          echo "PREVIEW OUTPUTS"
+          echo "PREVIEW GENERATED FILES"
           echo "=================================================="
           TARGET="${{ github.workspace }}/artifacts/${{ matrix.model }}-w${{ matrix.sae_width }}-s${{ matrix.seed }}"
 
@@ -378,7 +424,9 @@ jobs:
           echo "--- sweep_summary.md ---"
           cat "${TARGET}/sweep_summary.md" || true
 
-      - name: Upload artifacts
+          echo "=================================================="
+
+      - name: Upload artifact directory
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -387,11 +435,12 @@ jobs:
           retention-days: 30
           if-no-files-found: error
 
-      - name: Final status
+      - name: Final status message
         if: always()
         run: |
           echo "=================================================="
           echo "JOB COMPLETE"
           echo "=================================================="
-          echo "Artifact path:"
+          echo "Artifact directory:"
           echo "${{ github.workspace }}/artifacts/${{ matrix.model }}-w${{ matrix.sae_width }}-s${{ matrix.seed }}"
+          echo "=================================================="
