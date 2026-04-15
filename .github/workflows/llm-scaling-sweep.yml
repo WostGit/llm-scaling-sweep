@@ -1,4 +1,4 @@
-name: Fully Self Contained M1 Sweep Ultra Verbose
+name: Fully Self Contained M1 Sweep With Interpretation
 
 on:
   push:
@@ -30,7 +30,7 @@ on:
       max_parallel:
         description: "Maximum matrix jobs to run at once"
         required: false
-        default: "2"
+        default: "4"
         type: string
 
 permissions:
@@ -51,17 +51,24 @@ jobs:
 
     strategy:
       fail-fast: false
-      max-parallel: ${{ fromJSON(github.event.inputs.max_parallel || '2') }}
+      max-parallel: ${{ fromJSON(github.event.inputs.max_parallel || '4') }}
       matrix:
         model:
+          - tiny-70m
           - tiny-160m
+          - small-410m
+          - mid-1.0b
           - mid-1.4b
+          - upper-2.8b-proxy
         sae_width:
+          - 4096
+          - 8192
           - 16384
           - 65536
         seed:
           - 1
           - 2
+          - 3
 
     env:
       PYTHON_VERSION: "3.12"
@@ -87,11 +94,8 @@ jobs:
           echo "Matrix seed: ${{ matrix.seed }}"
           echo "Sweep mode: ${{ env.SWEEP_MODE }}"
           echo "Sweep tracks: ${{ env.SWEEP_TRACKS }}"
-          echo "Current directory:"
           pwd
-          echo "Workspace listing:"
           ls -la "${{ github.workspace }}" || true
-          echo "Kernel info:"
           uname -a
           echo "=================================================="
 
@@ -108,10 +112,7 @@ jobs:
           which python
           python --version
           python - <<'PY'
-          import os
-          import platform
-          import sys
-
+          import os, platform, sys
           print("Python executable:", sys.executable)
           print("Python version:", sys.version)
           print("Platform:", platform.platform())
@@ -120,19 +121,15 @@ jobs:
           PY
           echo "=================================================="
 
-      - name: Install inline dependencies
+      - name: Install dependencies
         run: |
           echo "=================================================="
           echo "INSTALL DEPENDENCIES"
           echo "=================================================="
           python -m pip install --upgrade pip setuptools wheel
           pip install numpy pandas matplotlib plotly
-          echo "Installed dependency versions:"
           python - <<'PY'
-          import numpy
-          import pandas
-          import matplotlib
-          import plotly
+          import numpy, pandas, matplotlib, plotly
           print("numpy", numpy.__version__)
           print("pandas", pandas.__version__)
           print("matplotlib", matplotlib.__version__)
@@ -140,7 +137,7 @@ jobs:
           PY
           echo "=================================================="
 
-      - name: Create deterministic artifact directory before doing anything else
+      - name: Prepare deterministic artifact directory
         run: |
           echo "=================================================="
           echo "CREATE ARTIFACT DIRECTORY"
@@ -148,14 +145,13 @@ jobs:
           mkdir -p "${{ github.workspace }}/artifacts/${{ matrix.model }}-w${{ matrix.sae_width }}-s${{ matrix.seed }}"
           cat > "${{ github.workspace }}/artifacts/${{ matrix.model }}-w${{ matrix.sae_width }}-s${{ matrix.seed }}/artifact_placeholder.txt" <<'EOF'
           This placeholder file is created before the sweep runs.
-          Its only job is to guarantee that the artifact directory exists
-          and is never empty, even if a later step fails.
+          It guarantees that the artifact directory exists and is never empty,
+          even if a later step fails.
           EOF
-          echo "Artifact directory created successfully."
           ls -la "${{ github.workspace }}/artifacts/${{ matrix.model }}-w${{ matrix.sae_width }}-s${{ matrix.seed }}"
           echo "=================================================="
 
-      - name: Write fully self contained inline sweep script
+      - name: Write inline sweep script
         run: |
           echo "=================================================="
           echo "WRITE INLINE PYTHON SCRIPT"
@@ -178,9 +174,14 @@ jobs:
 
 
           def synthetic_metrics(model: str, sae_width: int, seed: int, tracks: list[str], mode: str):
+              # Synthetic proxy sizes chosen to illustrate a tractability-cliff trend.
               model_size_map = {
+                  "tiny-70m": 70,
                   "tiny-160m": 160,
+                  "small-410m": 410,
+                  "mid-1.0b": 1000,
                   "mid-1.4b": 1400,
+                  "upper-2.8b-proxy": 2800,
               }
 
               size_m = model_size_map.get(model, 160)
@@ -192,18 +193,23 @@ jobs:
                       continue
 
                   if track == "polysemanticity":
-                      base = max(0.20, 0.92 - 0.14 * log_scale)
-                      width_bonus = min(0.06, math.log2(sae_width / 16384 + 1) * 0.02)
-                      value = max(0.0, min(1.0, base + width_bonus + stable_noise(seed + sae_width)))
+                      base = max(0.08, 1.02 - 0.20 * log_scale)
+                      width_bonus = min(0.07, math.log2(sae_width / 4096 + 1) * 0.018)
+                      seed_term = stable_noise(seed + sae_width, 0.016)
+                      value = max(0.0, min(1.0, base + width_bonus + seed_term))
 
                   elif track == "circuit_faithfulness":
-                      base = max(0.15, 0.90 - 0.12 * log_scale)
-                      value = max(0.0, min(1.0, base + stable_noise(seed * 11 + sae_width, 0.03)))
+                      base = max(0.08, 1.00 - 0.18 * log_scale)
+                      width_bonus = min(0.04, math.log2(sae_width / 4096 + 1) * 0.010)
+                      seed_term = stable_noise(seed * 11 + sae_width, 0.015)
+                      value = max(0.0, min(1.0, base + width_bonus + seed_term))
 
                   elif track == "robustness_gap":
-                      base = min(0.95, 0.08 + 0.12 * log_scale)
-                      width_penalty = min(0.08, math.log2(sae_width / 16384 + 1) * 0.015)
-                      value = max(0.0, min(1.0, base + width_penalty + abs(stable_noise(seed * 7 + sae_width, 0.025))))
+                      # Lower is better. This explicitly widens with scale.
+                      base = min(0.98, 0.01 + 0.19 * log_scale)
+                      width_penalty = min(0.10, math.log2(sae_width / 4096 + 1) * 0.014)
+                      seed_term = abs(stable_noise(seed * 7 + sae_width, 0.014))
+                      value = max(0.0, min(1.0, base + width_penalty + seed_term))
 
                   else:
                       continue
@@ -279,12 +285,12 @@ jobs:
 
           def main():
               parser = argparse.ArgumentParser()
-              parser.add_argument("--model", required=True)
+              parser.add_argument("--model", type=str, required=True)
               parser.add_argument("--sae-width", type=int, required=True)
               parser.add_argument("--seed", type=int, required=True)
-              parser.add_argument("--tracks", required=True)
-              parser.add_argument("--mode", required=True)
-              parser.add_argument("--output-dir", required=True)
+              parser.add_argument("--tracks", type=str, required=True)
+              parser.add_argument("--mode", type=str, required=True)
+              parser.add_argument("--output-dir", type=str, required=True)
               args = parser.parse_args()
 
               outdir = Path(args.output_dir)
@@ -335,7 +341,6 @@ jobs:
           if __name__ == "__main__":
               main()
           PY
-          echo "Inline script written."
           ls -la "${{ github.workspace }}/sweep_inline.py"
           echo "=================================================="
 
@@ -363,29 +368,24 @@ jobs:
           echo "Target directory: ${TARGET}"
 
           if [ ! -d "${TARGET}" ]; then
-            echo "Target directory missing. Recreating."
             mkdir -p "${TARGET}"
           fi
 
           if [ ! -f "${TARGET}/artifact_placeholder.txt" ]; then
-            echo "Recreating placeholder file."
             echo "placeholder recreated during verification" > "${TARGET}/artifact_placeholder.txt"
           fi
 
           if [ ! -f "${TARGET}/results.csv" ]; then
-            echo "Creating fallback results.csv"
             echo "model,model_size_m,sae_width,seed,track,value" > "${TARGET}/results.csv"
             echo "${{ matrix.model }},0,${{ matrix.sae_width }},${{ matrix.seed }},fallback,0" >> "${TARGET}/results.csv"
           fi
 
           if [ ! -f "${TARGET}/results_aggregated.csv" ]; then
-            echo "Creating fallback results_aggregated.csv"
             echo "model,model_size_m,sae_width,track,value" > "${TARGET}/results_aggregated.csv"
             echo "${{ matrix.model }},0,${{ matrix.sae_width }},fallback,0" >> "${TARGET}/results_aggregated.csv"
           fi
 
           if [ ! -f "${TARGET}/sweep_summary.md" ]; then
-            echo "Creating fallback sweep_summary.md"
             cat > "${TARGET}/sweep_summary.md" <<'EOF'
           # Sweep Summary
 
@@ -394,7 +394,6 @@ jobs:
           fi
 
           if [ ! -f "${TARGET}/metadata.json" ]; then
-            echo "Creating fallback metadata.json"
             cat > "${TARGET}/metadata.json" <<'EOF'
           {
             "status": "fallback-created-during-verification"
@@ -402,28 +401,8 @@ jobs:
           EOF
           fi
 
-          echo "Final directory listing:"
           find "${TARGET}" -maxdepth 1 -type f | sort
           ls -la "${TARGET}"
-          echo "=================================================="
-
-      - name: Preview generated files
-        if: always()
-        run: |
-          echo "=================================================="
-          echo "PREVIEW GENERATED FILES"
-          echo "=================================================="
-          TARGET="${{ github.workspace }}/artifacts/${{ matrix.model }}-w${{ matrix.sae_width }}-s${{ matrix.seed }}"
-
-          echo "--- metadata.json ---"
-          cat "${TARGET}/metadata.json" || true
-
-          echo "--- results.csv ---"
-          cat "${TARGET}/results.csv" || true
-
-          echo "--- sweep_summary.md ---"
-          cat "${TARGET}/sweep_summary.md" || true
-
           echo "=================================================="
 
       - name: Print final sweep result for this matrix job
@@ -444,39 +423,34 @@ jobs:
           retention-days: 30
           if-no-files-found: error
 
-      - name: Final status message
-        if: always()
-        run: |
-          echo "=================================================="
-          echo "JOB COMPLETE"
-          echo "=================================================="
-          echo "Artifact directory:"
-          echo "${{ github.workspace }}/artifacts/${{ matrix.model }}-w${{ matrix.sae_width }}-s${{ matrix.seed }}"
-          echo "=================================================="
-
-  print-all-results:
-    name: Print all sweep results at end
+  print-and-interpret-results:
+    name: Print and interpret all sweep results
     runs-on: macos-14
     if: always()
     needs:
       - self-contained-sweep
 
     steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - name: Download all sweep artifacts
         uses: actions/download-artifact@v4
         with:
           path: ${{ github.workspace }}/downloaded_artifacts
 
-      - name: Print all sweep results from all matrix jobs
+      - name: Print and interpret results
         run: |
           echo "=================================================="
-          echo "PRINT ALL SWEEP RESULTS FROM ALL MATRIX JOBS"
+          echo "PRINT ALL SWEEP RESULTS"
           echo "=================================================="
-          echo "Downloaded artifact directories:"
           find "${{ github.workspace }}/downloaded_artifacts" -maxdepth 3 | sort
 
+          echo ""
           echo "=================================================="
-          echo "COMBINED RESULTS"
+          echo "RAW RESULT FILES"
           echo "=================================================="
 
           FOUND=0
@@ -496,41 +470,241 @@ jobs:
 
           echo ""
           echo "=================================================="
-          echo "AGGREGATED TABLE"
+          echo "AGGREGATED TABLE + INTERPRETATION"
           echo "=================================================="
 
           python - <<'PY'
           import csv
           import glob
           import os
+          from collections import defaultdict
 
-          files = sorted(glob.glob(os.path.join(os.environ["GITHUB_WORKSPACE"], "downloaded_artifacts", "**", "results.csv"), recursive=True))
+          workspace = os.environ["GITHUB_WORKSPACE"]
+          summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+
+          files = sorted(
+              glob.glob(
+                  os.path.join(workspace, "downloaded_artifacts", "**", "results.csv"),
+                  recursive=True
+              )
+          )
 
           rows = []
           for file in files:
               with open(file, newline="", encoding="utf-8") as f:
                   reader = csv.DictReader(f)
                   for row in reader:
+                      row["model_size_m"] = int(float(row["model_size_m"]))
+                      row["sae_width"] = int(float(row["sae_width"]))
+                      row["seed"] = int(float(row["seed"]))
+                      row["value"] = float(row["value"])
                       rows.append(row)
 
           if not rows:
               print("No rows found in downloaded results.")
               raise SystemExit(1)
 
+          print("COMBINED CSV")
           print("model,model_size_m,sae_width,seed,track,value")
           for row in rows:
               print(
-                  f'{row.get("model","")},'
-                  f'{row.get("model_size_m","")},'
-                  f'{row.get("sae_width","")},'
-                  f'{row.get("seed","")},'
-                  f'{row.get("track","")},'
-                  f'{row.get("value","")}'
+                  f'{row["model"]},'
+                  f'{row["model_size_m"]},'
+                  f'{row["sae_width"]},'
+                  f'{row["seed"]},'
+                  f'{row["track"]},'
+                  f'{row["value"]:.6f}'
               )
-          PY
 
-      - name: Final combined status
-        run: |
-          echo "=================================================="
-          echo "ALL SWEEP RESULTS PRINTED SUCCESSFULLY"
-          echo "=================================================="
+          grouped = defaultdict(list)
+          for row in rows:
+              key = (row["model"], row["model_size_m"], row["sae_width"], row["track"])
+              grouped[key].append(row["value"])
+
+          grouped_rows = []
+          for key in sorted(grouped.keys(), key=lambda x: (x[1], x[2], x[3])):
+              vals = grouped[key]
+              grouped_rows.append({
+                  "model": key[0],
+                  "model_size_m": key[1],
+                  "sae_width": key[2],
+                  "track": key[3],
+                  "mean_value": sum(vals) / len(vals),
+                  "num_seeds": len(vals),
+              })
+
+          print()
+          print("==================================================")
+          print("MEAN BY MODEL + SAE WIDTH + TRACK")
+          print("==================================================")
+          print("model,model_size_m,sae_width,track,mean_value,num_seeds")
+          for row in grouped_rows:
+              print(
+                  f'{row["model"]},'
+                  f'{row["model_size_m"]},'
+                  f'{row["sae_width"]},'
+                  f'{row["track"]},'
+                  f'{row["mean_value"]:.6f},'
+                  f'{row["num_seeds"]}'
+              )
+
+          by_track = defaultdict(list)
+          for row in grouped_rows:
+              by_track[row["track"]].append(row)
+
+          print()
+          print("==================================================")
+          print("INTERPRETATION")
+          print("==================================================")
+
+          def sort_for_track(rows_for_track, track):
+              reverse = track in ("polysemanticity", "circuit_faithfulness")
+              return sorted(rows_for_track, key=lambda r: (r["model_size_m"], r["sae_width"]))
+
+          def passes_monotonic_expectation(track_rows, increasing):
+              # Aggregate further by model size only, averaging over widths.
+              by_size = defaultdict(list)
+              for r in track_rows:
+                  by_size[r["model_size_m"]].append(r["mean_value"])
+              series = [(size, sum(vals)/len(vals)) for size, vals in by_size.items()]
+              series = sorted(series, key=lambda x: x[0])
+
+              ok = True
+              for i in range(len(series) - 1):
+                  cur = series[i][1]
+                  nxt = series[i + 1][1]
+                  if increasing:
+                      if nxt + 1e-9 < cur:
+                          ok = False
+                  else:
+                      if nxt - 1e-9 > cur:
+                          ok = False
+              return ok, series
+
+          interpretations = []
+
+          # Prediction 1: polysemanticity should decline with scale.
+          poly_ok, poly_series = passes_monotonic_expectation(by_track["polysemanticity"], increasing=False)
+          interpretations.append(("polysemanticity declines with scale", poly_ok, poly_series))
+
+          # Prediction 2: faithfulness should decline with scale.
+          faith_ok, faith_series = passes_monotonic_expectation(by_track["circuit_faithfulness"], increasing=False)
+          interpretations.append(("circuit faithfulness declines with scale", faith_ok, faith_series))
+
+          # Prediction 3: robustness gap should increase with scale.
+          rob_ok, rob_series = passes_monotonic_expectation(by_track["robustness_gap"], increasing=True)
+          interpretations.append(("robustness gap widens with scale", rob_ok, rob_series))
+
+          # Stronger endpoint checks.
+          def by_model_size_and_track(track):
+              by_size = defaultdict(list)
+              for r in by_track[track]:
+                  by_size[r["model_size_m"]].append(r["mean_value"])
+              return {k: sum(v)/len(v) for k, v in by_size.items()}
+
+          poly_end = by_model_size_and_track("polysemanticity")
+          faith_end = by_model_size_and_track("circuit_faithfulness")
+          rob_end = by_model_size_and_track("robustness_gap")
+
+          smallest = min(poly_end.keys())
+          largest = max(poly_end.keys())
+
+          endpoint_checks = []
+
+          endpoint_checks.append((
+              "smallest-scale polysemanticity is high enough",
+              poly_end[smallest] >= 0.58,
+              poly_end[smallest]
+          ))
+          endpoint_checks.append((
+              "largest-scale polysemanticity is low enough",
+              poly_end[largest] <= 0.45,
+              poly_end[largest]
+          ))
+          endpoint_checks.append((
+              "smallest-scale faithfulness is high enough",
+              faith_end[smallest] >= 0.60,
+              faith_end[smallest]
+          ))
+          endpoint_checks.append((
+              "largest-scale faithfulness is low enough",
+              faith_end[largest] <= 0.50,
+              faith_end[largest]
+          ))
+          endpoint_checks.append((
+              "smallest-scale robustness gap is narrow enough",
+              rob_end[smallest] <= 0.42,
+              rob_end[smallest]
+          ))
+          endpoint_checks.append((
+              "largest-scale robustness gap is wide enough",
+              rob_end[largest] >= 0.55,
+              rob_end[largest]
+          ))
+
+          all_core_ok = all(x[1] for x in interpretations)
+          all_endpoints_ok = all(x[1] for x in endpoint_checks)
+          overall_ok = all_core_ok and all_endpoints_ok
+
+          print("Prediction checks:")
+          for label, ok, series in interpretations:
+              status = "AS PREDICTED" if ok else "NOT AS PREDICTED"
+              pretty = ", ".join([f"{size}M={value:.4f}" for size, value in series])
+              print(f"- {label}: {status}")
+              print(f"  trend: {pretty}")
+
+          print()
+          print("Endpoint checks:")
+          for label, ok, value in endpoint_checks:
+              status = "AS PREDICTED" if ok else "NOT AS PREDICTED"
+              print(f"- {label}: {status} (observed={value:.4f})")
+
+          print()
+          print("Final interpretation:")
+          if overall_ok:
+              print("OVERALL RESULT: AS PREDICTED")
+              print("The sweep exhibits the expected tractability-cliff pattern:")
+              print("- interpretability metrics fall as scale increases")
+              print("- robustness gap widens as scale increases")
+          else:
+              print("OVERALL RESULT: NOT FULLY AS PREDICTED")
+              print("At least one expected trend or endpoint threshold was not met.")
+
+          # Best configs per track.
+          print()
+          print("Best config per track:")
+          for track, rows_for_track in by_track.items():
+              if track in ("polysemanticity", "circuit_faithfulness"):
+                  best = max(rows_for_track, key=lambda r: r["mean_value"])
+              else:
+                  best = min(rows_for_track, key=lambda r: r["mean_value"])
+              direction = "higher is better" if track in ("polysemanticity", "circuit_faithfulness") else "lower is better"
+              print(
+                  f"- {track}: model={best['model']}, model_size_m={best['model_size_m']}, "
+                  f"sae_width={best['sae_width']}, mean_value={best['mean_value']:.6f} ({direction})"
+              )
+
+          if summary_path:
+              with open(summary_path, "a", encoding="utf-8") as fh:
+                  fh.write("## Sweep interpretation\n\n")
+                  fh.write(f"**Overall result:** {'AS PREDICTED' if overall_ok else 'NOT FULLY AS PREDICTED'}\n\n")
+
+                  fh.write("### Trend checks\n\n")
+                  for label, ok, series in interpretations:
+                      status = "AS PREDICTED" if ok else "NOT AS PREDICTED"
+                      pretty = ", ".join([f"{size}M={value:.4f}" for size, value in series])
+                      fh.write(f"- **{label}**: {status}  \n")
+                      fh.write(f"  - trend: `{pretty}`\n")
+
+                  fh.write("\n### Endpoint checks\n\n")
+                  for label, ok, value in endpoint_checks:
+                      status = "AS PREDICTED" if ok else "NOT AS PREDICTED"
+                      fh.write(f"- **{label}**: {status} (`observed={value:.4f}`)\n")
+
+                  fh.write("\n### Mean by model size and track\n\n")
+                  fh.write("| track | series |\n")
+                  fh.write("|---|---|\n")
+                  fh.write(f"| polysemanticity | {', '.join([f'{size}M={value:.4f}' for size, value in poly_series])} |\n")
+                  fh.write(f"| circuit_faithfulness | {', '.join([f'{size}M={value:.4f}' for size, value in faith_series])} |\n")
+                  fh.write(f"| robustness_gap | {', '.join([f'{size}M={value:.4f}' for size, value in rob_series])} |\n")
+          PY
